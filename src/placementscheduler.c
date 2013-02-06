@@ -92,6 +92,7 @@ void LpelPlacementScheduler(void *arg)
     t->new_worker = worker_indexes[0];
 #else
     t->new_worker = rand() % config->num_workers;
+    t->placement_data->queued = 0;
 #endif
   }
 
