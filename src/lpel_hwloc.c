@@ -17,6 +17,10 @@
 static int pu_count;
 
 #ifdef HAVE_HWLOC
+static int pus;
+static int cores;
+static int sockets;
+
 static hwloc_cpuset_t   *cpu_sets;
 static lpel_hw_place_t  *hw_places;
 
@@ -43,36 +47,100 @@ static int LpelCanSetExclusive(void)
 }
 
 #ifdef HAVE_HWLOC
-inline static void traverse(hwloc_obj_t object)
+inline static void traverseBF(hwloc_obj_t object)
 {
-  static int index = 0, socket = -1, core = -1, pu = -1;
+  static int start, index = 0, socket = -1, core = -1, pu = -1;
+  static int setSock = 0, setCore = 0, setPu = 0;
+  if (index == pu_count) return;
 
-  assert(index < pu_count);
-  switch (object->type) {
-    case HWLOC_OBJ_SOCKET:
-        socket++;
+  if (start == -1) {
+    for (start = 0; index < pu_count; start++) {
+      for (int i = 0; i < object->arity && index < pu_count; i++) {
+        socket = -1;
         core = -1;
         pu = -1;
-        break;
+        traverseBF(object->children[i]);
+      }
+    }
+
+    return;
+  }
+
+  switch (object->type) {
+    case HWLOC_OBJ_SOCKET:
+      socket++;
+      core = -1;
+      pu = -1;
+      break;
     case HWLOC_OBJ_CORE:
-        core++;
-        pu = -1;
-        break;
+      core++;
+      pu = -1;
+      break;
     case HWLOC_OBJ_PU:
-        pu++;
+      pu++;
+      if (setSock == socket
+          && setCore == core
+          && setPu == pu) {
         hw_places[index].socket = socket;
         hw_places[index].core = core;
         hw_places[index].pu = pu;
         cpu_sets[index] = hwloc_bitmap_dup(object->cpuset);
         index++;
-        break;
+
+        setSock = ++setSock % sockets;
+        if (setSock == 0) {
+          setCore = ++setCore % cores;
+          if (setCore == 0) {
+            setPu = ++setPu % pus;
+          }
+        }
+      }
+      break;
     default:
-        break;
+      break;
   }
 
-  for (int i = 0; i < object->arity; i++) {
-    traverse(object->children[i]);
+  for (int i = 0; i < object->arity && index < pu_count; i++) {
+    traverseBF(object->children[i]);
   }
+}
+
+inline static void traverseDF(hwloc_obj_t object)
+{
+  static int index = 0, socket = -1, core = -1, pu = -1;
+  if (index == pu_count) return;
+
+  switch (object->type) {
+    case HWLOC_OBJ_SOCKET:
+      socket++;
+      core = -1;
+      pu = -1;
+      break;
+    case HWLOC_OBJ_CORE:
+      core++;
+      pu = -1;
+      break;
+    case HWLOC_OBJ_PU:
+      pu++;
+      hw_places[index].socket = socket;
+      hw_places[index].core = core;
+      hw_places[index].pu = pu;
+      cpu_sets[index] = hwloc_bitmap_dup(object->cpuset);
+      index++;
+      break;
+    default:
+      break;
+  }
+
+  for (int i = 0; i < object->arity && index < pu_count; i++) {
+    traverseDF(object->children[i]);
+  }
+}
+
+inline static void traverse(hwloc_obj_t object, int gather)
+{
+  if (gather) traverseDF(object);
+  else traverseBF(object);
 }
 
 int LpelHwLocToWorker(lpel_hw_place_t place)
@@ -96,11 +164,16 @@ void LpelHwLocInit(lpel_config_t *cfg)
   hwloc_topology_load(topology);
 
   pu_count = hwloc_get_nbobjs_by_type(topology, HWLOC_OBJ_PU);
+  cores = hwloc_get_nbobjs_by_type(topology, HWLOC_OBJ_CORE);
+  sockets = hwloc_get_nbobjs_by_type(topology, HWLOC_OBJ_SOCKET);
 
-  cpu_sets = malloc(pu_count * sizeof(hwloc_cpuset_t));
-  hw_places = malloc(pu_count * sizeof(lpel_hw_place_t));
+  pus = pu_count / cores;
+  cores = cores / sockets;
 
-  traverse(hwloc_get_root_obj(topology));
+  cfg->sockets = sockets;
+  cfg->cores = cores;
+  cfg->threads = pus;
+  cfg->gather = 0;
 #elif defined(HAVE_SYSCONF)
   /* query the number of CPUs */
   pu_count = sysconf(_SC_NPROCESSORS_ONLN);
@@ -133,6 +206,15 @@ int LpelHwLocCheckConfig(lpel_config_t *cfg)
     return LPEL_ERR_INVAL;
   }
 
+  pu_count = cfg->proc_workers + cfg->proc_others;
+
+#ifdef HAVE_HWLOC
+  if (cfg->threads <= pus && cfg->cores <= cores && cfg->sockets <= sockets
+      && pu_count > cfg->threads * cfg->cores * cfg->sockets) {
+    return LPEL_ERR_INVAL;
+  }
+#endif
+
   /* check exclusive flag sanity */
   if (LPEL_ICFG(LPEL_FLAG_EXCLUSIVE)) {
     /* check if we can do a 1-1 mapping */
@@ -157,7 +239,14 @@ int LpelHwLocCheckConfig(lpel_config_t *cfg)
 void LpelHwLocStart(lpel_config_t *cfg)
 {
 #ifdef HAVE_HWLOC
-    //FIXME
+  pus = cfg->threads;
+  cores = cfg->cores;
+  sockets = cfg->sockets;
+
+  cpu_sets = malloc(pu_count * sizeof(*cpu_sets));
+  hw_places = malloc(pu_count * sizeof(*hw_places));
+
+  traverse(hwloc_get_root_obj(topology), cfg->gather);
 #elif defined(HAVE_PTHREAD_SETAFFINITY_NP)
   /* create the cpu_set for worker threads */
   CPU_ZERO(&cpuset_workers);
@@ -187,7 +276,6 @@ int LpelThreadAssign(int core)
 {
   int res;
 #ifdef HAVE_HWLOC
-  //FIXME
   if (core < 0) return 0;
 
   res = hwloc_set_cpubind(topology, cpu_sets[core],
