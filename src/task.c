@@ -345,7 +345,6 @@ static void TaskStartup( void *data)
       TaskStart( t);
       /* call the task function with inarg as parameter */
       t->func(t->inarg);
-      t->state = TASK_ZOMBIE;
 
       if (t->terminate) break;
 
