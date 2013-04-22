@@ -89,6 +89,10 @@ typedef struct {
   struct lpel_monitoring_cb_t mon;
   float threshold;
   int placement;
+  int gather;
+  int sockets;
+  int cores;
+  int threads;
 } lpel_config_t;
 
 
